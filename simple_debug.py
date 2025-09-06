@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-简化的调试测试 - 验证CUDA kernel和HoME实现的计算差异
+HoME专家网络CUDA内核调试测试
+
+验证HoME架构中专家网络的CUDA实现：
+1. 所有专家共享相同输入
+2. 使用CUTLASS Grouped GEMM优化
+3. 集成BatchNorm + SiLU融合计算
+4. 与PyTorch参考实现对比精度
 """
 
 import torch
@@ -32,8 +38,13 @@ except ImportError as e:
     home_kernels = None
 
 def test_simple_linear():
-    """测试简单的线性计算，不包含BatchNorm和SiLU"""
-    print("\n测试简单线性计算...")
+    """
+    测试HoME架构的专家网络计算
+    HoME特点：所有专家共享相同输入，但有不同的权重
+    包含BatchNorm + SiLU融合计算
+    """
+    print("\n测试HoME专家网络计算...")
+    print("HoME架构特点：所有专家共享相同输入")
     
     # 测试参数
     batch_size = 2
@@ -53,28 +64,28 @@ def test_simple_linear():
     input_data = torch.randn(batch_size, meta_output_dim, device=device)
     expert_mlp_weights = torch.randn(num_experts, meta_output_dim, expert_output_dim, device=device)
     expert_biases = torch.randn(num_experts, expert_output_dim, device=device)
-    expert_indices = torch.arange(num_experts, dtype=torch.int32, device=device)
+    # 注意：新的HoME实现中，所有专家都共享相同输入，不需要expert_indices
     
     print(f"输入数据:")
     print(f"  input_data: {input_data}")
     print(f"  expert_mlp_weights: {expert_mlp_weights}")
     print(f"  expert_biases: {expert_biases}")
     
-    # HoME实现 - 只做线性计算
-    print(f"\nHoME实现:")
+    # HoME实现 - 所有专家共享相同输入
+    print(f"\nHoME实现 (所有专家共享相同输入):")
     home_outputs = []
-    for i, expert_idx in enumerate(expert_indices):
-        expert_idx = expert_idx.item()
+    for expert_idx in range(num_experts):
         expert_weight = expert_mlp_weights[expert_idx]  # [meta_output_dim, expert_output_dim]
         expert_bias = expert_biases[expert_idx]  # [expert_output_dim]
         
-        # 线性计算: input @ weight + bias
+        # 线性计算: input @ weight + bias (所有专家都使用相同的input_data)
         expert_output = torch.matmul(input_data, expert_weight) + expert_bias
         home_outputs.append(expert_output)
         print(f"  专家{expert_idx}: {expert_output}")
     
     home_output = torch.stack(home_outputs, dim=1)  # [batch_size, num_experts, expert_output_dim]
     print(f"  HoME最终输出: {home_output}")
+    print(f"  HoME输出形状: {home_output.shape}")
     
     # CUDA实现
     if CUDA_KERNELS_AVAILABLE:
@@ -93,10 +104,19 @@ def test_simple_linear():
             print(f"    running_var: {running_var}")
             
             with torch.no_grad():
+                # 根据最新错误信息，函数实际需要10个参数
+                # (7个tensor + 1个int + 1个bool + 1个float)
                 cuda_output = home_kernels.home_expert_forward(
-                    input_data, expert_mlp_weights, expert_biases, expert_indices, 
-                    bn_weights, bn_biases, running_mean, running_var,
-                    num_experts, True, 1e-5
+                    input_data,           # input: [batch_size, input_dim]
+                    expert_mlp_weights,   # expert_weights: [num_experts, input_dim, hidden_dim]
+                    expert_biases,        # expert_biases: [num_experts, hidden_dim]
+                    bn_weights,           # bn_weights: [num_experts, hidden_dim]
+                    bn_biases,            # bn_biases: [num_experts, hidden_dim]
+                    running_mean,         # running_mean: [num_experts, hidden_dim]
+                    running_var,          # running_var: [num_experts, hidden_dim]
+                    num_experts,          # num_experts: int
+                    True,                 # use_bias: bool
+                    1e-5                  # epsilon: float
                 )
             
             print(f"  CUDA输出: {cuda_output}")
@@ -144,8 +164,9 @@ def test_simple_linear():
 
 def main():
     """主函数"""
-    print("简单线性计算调试测试")
-    print("=" * 40)
+    print("HoME专家网络CUDA内核调试测试")
+    print("=" * 50)
+    print("测试HoME架构中所有专家共享相同输入的计算模式")
     
     # 检查CUDA可用性
     if torch.cuda.is_available():

@@ -107,18 +107,18 @@ def create_home_expert_sequential(input_data, expert_mlp_weights, expert_biases,
     return output
 
 
-def create_home_expert_sequential_with_bn(input_data, expert_mlp_weights, expert_biases, expert_indices, 
+def create_home_expert_sequential_with_bn(input_data, expert_mlp_weights, expert_biases, 
                                         bn_weights, bn_biases, running_mean, running_var, 
                                         meta_output_dim, dim, num_experts, use_bias=True, epsilon=1e-5):
     """
-    完全复刻HoME.py中的专家计算逻辑，使用指定的BatchNorm参数
+    HoME架构的专家计算逻辑，使用指定的BatchNorm参数
+    HoME特点：所有专家共享相同输入，但有不同的权重
     使用Sequential(MLPLayer, BatchNorm, SiLU)结构
     
     Args:
-        input_data: [batch_size, meta_output_dim] - 专家输入（来自Meta层）
+        input_data: [batch_size, meta_output_dim] - 专家输入（所有专家共享）
         expert_mlp_weights: [num_experts, meta_output_dim, dim] - MLP层权重
         expert_biases: [num_experts, dim] - MLP层偏置
-        expert_indices: [num_selected_experts] - 选中的专家索引
         bn_weights: [num_experts, dim] - BatchNorm权重
         bn_biases: [num_experts, dim] - BatchNorm偏置
         running_mean: [num_experts, dim] - BatchNorm运行均值
@@ -128,54 +128,51 @@ def create_home_expert_sequential_with_bn(input_data, expert_mlp_weights, expert
         num_experts: 专家总数
     """
     batch_size = input_data.size(0)
-    num_selected_experts = expert_indices.size(0)
     
-    # 分配输出内存
-    output = torch.zeros(batch_size, num_selected_experts, dim, 
+    # HoME架构：输出形状为 [batch_size, num_experts, dim]
+    output = torch.zeros(batch_size, num_experts, dim, 
                        device=input_data.device, dtype=input_data.dtype)
     
-    # 完全复刻HoME.py中的专家计算逻辑
-    for i, expert_idx in enumerate(expert_indices):
-        expert_idx = expert_idx.item()
-        if expert_idx < num_experts:
-            # 创建专家网络，完全按照HoME.py中的结构
-            # 1. MLPLayer(meta_output_dim, [dim], activate="relu")
-            expert_mlp = MLPLayer(meta_output_dim, [dim], activate="relu", name=f"expert_{expert_idx}")
+    # HoME架构：所有专家都处理相同的输入
+    for expert_idx in range(num_experts):
+        # 创建专家网络，完全按照HoME.py中的结构
+        # 1. MLPLayer(meta_output_dim, [dim], activate="relu")
+        expert_mlp = MLPLayer(meta_output_dim, [dim], activate="relu", name=f"expert_{expert_idx}")
+        
+        # 2. BatchNorm1d - 使用指定的参数
+        batch_norm = nn.BatchNorm1d(dim)
+        
+        # 3. SiLU激活函数
+        silu_activation = nn.SiLU()
+        
+        # 设置MLP层权重和偏置
+        with torch.no_grad():
+            # expert_mlp_weights[expert_idx] 的形状是 [meta_output_dim, dim]
+            # MLPLayer内部只有一个Linear层，权重形状是 [dim, meta_output_dim]
+            expert_mlp.linears[0].linear.weight.data.copy_(expert_mlp_weights[expert_idx].t())
+            if use_bias and expert_biases is not None:
+                expert_mlp.linears[0].linear.bias.data.copy_(expert_biases[expert_idx])
             
-            # 2. BatchNorm1d - 使用指定的参数
-            batch_norm = nn.BatchNorm1d(dim)
-            
-            # 3. SiLU激活函数
-            silu_activation = nn.SiLU()
-            
-            # 设置MLP层权重和偏置
-            with torch.no_grad():
-                # expert_mlp_weights[expert_idx] 的形状是 [meta_output_dim, dim]
-                # MLPLayer内部只有一个Linear层，权重形状是 [dim, meta_output_dim]
-                expert_mlp.linears[0].linear.weight.data.copy_(expert_mlp_weights[expert_idx].t())
-                if use_bias and expert_biases is not None:
-                    expert_mlp.linears[0].linear.bias.data.copy_(expert_biases[expert_idx])
-                
-                # 设置BatchNorm参数
-                batch_norm.weight.data.copy_(bn_weights[expert_idx])
-                batch_norm.bias.data.copy_(bn_biases[expert_idx])
-                batch_norm.running_mean.data.copy_(running_mean[expert_idx])
-                batch_norm.running_var.data.copy_(running_var[expert_idx])
-            
-            # 移动到正确的设备
-            expert_mlp = expert_mlp.to(input_data.device)
-            batch_norm = batch_norm.to(input_data.device)
-            
-            # 设置为评估模式，确保使用running_mean和running_var而不是当前批次的统计信息
-            batch_norm.eval()
-            
-            # 按照HoME.py中的顺序执行：MLP -> BatchNorm -> SiLU
-            expert_output = expert_mlp(input_data)  # MLPLayer
-            expert_output = batch_norm(expert_output)  # BatchNorm (使用running stats)
-            expert_output = silu_activation(expert_output)  # SiLU激活
-            
-            # 存储到输出张量中
-            output[:, i, :] = expert_output
+            # 设置BatchNorm参数
+            batch_norm.weight.data.copy_(bn_weights[expert_idx])
+            batch_norm.bias.data.copy_(bn_biases[expert_idx])
+            batch_norm.running_mean.data.copy_(running_mean[expert_idx])
+            batch_norm.running_var.data.copy_(running_var[expert_idx])
+        
+        # 移动到正确的设备
+        expert_mlp = expert_mlp.to(input_data.device)
+        batch_norm = batch_norm.to(input_data.device)
+        
+        # 设置为评估模式，确保使用running_mean和running_var而不是当前批次的统计信息
+        batch_norm.eval()
+        
+        # 按照HoME.py中的顺序执行：MLP -> BatchNorm -> SiLU
+        expert_output = expert_mlp(input_data)  # MLPLayer
+        expert_output = batch_norm(expert_output)  # BatchNorm (使用running stats)
+        expert_output = silu_activation(expert_output)  # SiLU激活
+        
+        # 存储到输出张量中：HoME架构中expert_idx就是输出的第二个维度索引
+        output[:, expert_idx, :] = expert_output
     
     return output
 
@@ -315,7 +312,7 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
             # 测试CUDA kernel（集成BatchNorm和SiLU）
             with torch.no_grad():
                 cuda_output = home_kernels.home_expert_forward(
-                    input_data, expert_mlp_weights, expert_biases, expert_indices, 
+                    input_data, expert_mlp_weights, expert_biases,
                     bn_weights, bn_biases, running_mean, running_var,
                     num_experts, True, 1e-5
                 )
@@ -326,7 +323,7 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
             # 性能测试
             def cuda_func():
                 return home_kernels.home_expert_forward(
-                    input_data, expert_mlp_weights, expert_biases, expert_indices, 
+                    input_data, expert_mlp_weights, expert_biases,
                     bn_weights, bn_biases, running_mean, running_var,
                     num_experts, True, 1e-5
                 )
@@ -355,7 +352,7 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
         # 测试HoME.py的实际实现 - 使用与CUDA kernel相同的参数
         with torch.no_grad():
             home_output = create_home_expert_sequential_with_bn(
-                input_data, expert_mlp_weights, expert_biases, expert_indices, 
+                input_data, expert_mlp_weights, expert_biases, 
                 bn_weights, bn_biases, running_mean, running_var, 
                 meta_output_dim, expert_output_dim, num_experts, True
             )
@@ -366,7 +363,7 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
         # 性能测试
         def home_func():
             return create_home_expert_sequential_with_bn(
-                input_data, expert_mlp_weights, expert_biases, expert_indices, 
+                input_data, expert_mlp_weights, expert_biases, 
                 bn_weights, bn_biases, running_mean, running_var, 
                 meta_output_dim, expert_output_dim, num_experts, True
             )

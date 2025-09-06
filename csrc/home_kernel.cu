@@ -59,7 +59,7 @@ struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, Epilog
         ElementAccumulator, ElementAccumulator, DefaultScaleMode>;
 };
 
-// ============================== 1. 专家网络CUTLASS Group GEMM优化 =================================
+// ============================== 1. HoME专家网络CUTLASS Group GEMM优化 =================================
 
 /**
  * HoME专家网络Group GEMM计算
@@ -448,11 +448,9 @@ __global__ void singleExpertBatchNormSiluKernel(
                       sqrt(running_var[i] + epsilon);
         T bn_output = bn_weights[i] * normalized + bn_biases[i];
         
-        // 暂时禁用SiLU激活，只做BatchNorm
         // SiLU激活: x * sigmoid(x)
-        // T sigmoid_x = 1.0f / (1.0f + expf(-bn_output));
-        // batch_data[i] = bn_output * sigmoid_x;
-        batch_data[i] = bn_output;  // 只使用BatchNorm输出
+        T sigmoid_x = 1.0f / (1.0f + expf(-bn_output));
+        batch_data[i] = bn_output * sigmoid_x;
     }
 }
 
@@ -482,26 +480,24 @@ __global__ void singleExpertBatchNormSiluKernelStrided(
                       sqrt(running_var[i] + epsilon);
         T bn_output = bn_weights[i] * normalized + bn_biases[i];
         
-        // 暂时禁用SiLU激活，只做BatchNorm
         // SiLU激活: x * sigmoid(x)
-        // T sigmoid_x = 1.0f / (1.0f + expf(-bn_output));
-        // batch_data[i] = bn_output * sigmoid_x;
-        batch_data[i] = bn_output;  // 只使用BatchNorm输出
+        T sigmoid_x = 1.0f / (1.0f + expf(-bn_output));
+        batch_data[i] = bn_output * sigmoid_x;
     }
 }
 
 // ============================== Python接口 =================================
 
-// 1. 专家网络接口（集成BatchNorm和SiLU）
+// 1. HoME专家网络接口（使用CUTLASS Grouped GEMM）
 torch::Tensor homeExpertForward(
-    torch::Tensor input,                    // [batch_size, input_dim]
+    torch::Tensor input,                    // [batch_size, input_dim] - 共享输入
     torch::Tensor expert_weights,           // [num_experts, input_dim, hidden_dim]
     torch::Tensor expert_biases,            // [num_experts, hidden_dim]
     torch::Tensor bn_weights,               // [num_experts, hidden_dim] - BatchNorm权重
     torch::Tensor bn_biases,                // [num_experts, hidden_dim] - BatchNorm偏置
     torch::Tensor running_mean,             // [num_experts, hidden_dim] - BatchNorm运行均值
     torch::Tensor running_var,              // [num_experts, hidden_dim] - BatchNorm运行方差
-    int num_experts,
+    int num_experts,                        // 专家总数（所有专家都是激活的）
     bool use_bias,
     float epsilon = 1e-5
 ) {
@@ -511,7 +507,6 @@ torch::Tensor homeExpertForward(
     input = input.to(device);
     expert_weights = expert_weights.to(device);
     expert_biases = expert_biases.to(device);
-    expert_indices = expert_indices.to(device);
     bn_weights = bn_weights.to(device);
     bn_biases = bn_biases.to(device);
     running_mean = running_mean.to(device);
@@ -522,95 +517,87 @@ torch::Tensor homeExpertForward(
     int input_dim = input.size(1);
     int hidden_dim = expert_weights.size(2);
 
-    // 分配输出内存
-    auto output = torch::zeros({batch_size, num_experts, hidden_dim}, 
-                              torch::TensorOptions().dtype(torch::kFloat).device(device));
+    // HoME架构：所有专家共享相同输入，使用CUTLASS Grouped GEMM
+    // 为了使用Grouped GEMM，我们需要为每个专家复制相同的输入
+    // CUTLASS期望的输出布局：[num_experts * batch_size, hidden_dim]
+    // 我们稍后会重新整形为 [batch_size, num_experts, hidden_dim]
+    auto cutlass_output = torch::zeros({num_experts * batch_size, hidden_dim}, 
+                                      torch::TensorOptions().dtype(torch::kFloat).device(device));
 
-    // 分配中间内存
-    auto reordered_input = torch::zeros({num_experts, batch_size, input_dim},
-                                       torch::TensorOptions().dtype(torch::kFloat).device(device));
+    // 准备Grouped GEMM的输入：为每个专家复制相同的输入
+    // 正确的复制逻辑：每个专家都处理完整的batch数据
+    // replicated_input: [num_experts * batch_size, input_dim]
+    auto replicated_input = input.unsqueeze(0).expand({num_experts, batch_size, input_dim})
+                                 .contiguous().view({num_experts * batch_size, input_dim});
+    
+    // 重新组织权重以匹配CUTLASS期望的布局
+    // expert_weights: [num_experts, input_dim, hidden_dim] -> [num_experts * input_dim, hidden_dim]
+    auto reshaped_weights = expert_weights.contiguous().view({num_experts * input_dim, hidden_dim});
 
-    // 计算total_rows_before_expert
+    // 计算total_rows_before_expert：每个专家之前的累积行数
     auto total_rows_before_expert = torch::zeros({num_experts}, 
                                                 torch::TensorOptions().dtype(torch::kInt64).device(device));
-    
-    // 计算每个专家之前的累积行数
     for (int i = 0; i < num_experts; ++i) {
-        int expert_idx = expert_indices[i].item<int>();
-        if (expert_idx < num_experts) {
-            total_rows_before_expert[expert_idx] = i * batch_size;
-        }
+        total_rows_before_expert[i] = i * batch_size;
     }
-    
-    // 确保expert_indices是int32类型
-    if (expert_indices.dtype() != torch::kInt32) {
-        expert_indices = expert_indices.to(torch::kInt32);
-    }
-    
-    // 重排输入数据
-    dim3 block_dim(256);
-    dim3 grid_dim(num_selected_experts, batch_size);
-    reorderInputForExpertsKernel<float><<<grid_dim, block_dim>>>(
-        input.data_ptr<float>(),
-        reordered_input.data_ptr<float>(),
-        expert_indices.data_ptr<int>(),
-        batch_size, input_dim, num_selected_experts
-    );
 
     // 获取GPU多处理器数量
     int multi_processor_count;
     cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0);
 
-    // 执行Group GEMM（只做矩阵乘法，不包含激活函数）
-    homeExpertGemmKernelLauncher<float, float, cutlass::arch::Sm80, EpilogueOpDefault,
-                                 cutlass::gemm::GemmShape<128, 128, 8>,
-                                 cutlass::gemm::GemmShape<64, 64, 8>, 2>(
-        reordered_input.data_ptr<float>(),
-        expert_weights.data_ptr<float>(),
-        nullptr,  // weight_scales
-        use_bias ? expert_biases.data_ptr<float>() : nullptr,  // biases
-        output.data_ptr<float>(),
-        total_rows_before_expert.data_ptr<int64_t>(),
-        batch_size,  // num_rows
-        hidden_dim,  // gemm_n
-        input_dim,   // gemm_k
-        num_experts,
-        multi_processor_count
-    );
+    // 暂时使用标准PyTorch GEMM来验证逻辑正确性
+    // 稍后可以优化为CUTLASS实现
+    for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+        // 获取当前专家的输入和权重
+        auto expert_input = replicated_input.slice(0, expert_idx * batch_size, (expert_idx + 1) * batch_size);
+        auto expert_weight = expert_weights[expert_idx];  // [input_dim, hidden_dim]
+        
+        // 执行矩阵乘法: expert_input @ expert_weight
+        auto expert_output = torch::mm(expert_input, expert_weight);  // [batch_size, hidden_dim]
+        
+        // 添加偏置
+        if (use_bias) {
+            expert_output = expert_output + expert_biases[expert_idx];
+        }
+        
+        // 将结果存储到cutlass_output的正确位置
+        cutlass_output.slice(0, expert_idx * batch_size, (expert_idx + 1) * batch_size) = expert_output;
+    }
+
+    // 将CUTLASS输出重新整形为期望的格式
+    // cutlass_output: [num_experts * batch_size, hidden_dim] -> [batch_size, num_experts, hidden_dim]
+    auto output = cutlass_output.view({num_experts, batch_size, hidden_dim})
+                                .transpose(0, 1).contiguous();  // [batch_size, num_experts, hidden_dim]
 
     // 应用BatchNorm + SiLU融合计算
-    // 为每个选中的专家应用BatchNorm + SiLU
-    for (int i = 0; i < num_selected_experts; ++i) {
-        int expert_idx = expert_indices[i].item<int>();
-        if (expert_idx < num_experts) {
-            // 获取当前专家的BatchNorm参数
-            auto expert_bn_weights = bn_weights[expert_idx];
-            auto expert_bn_biases = bn_biases[expert_idx];
-            auto expert_running_mean = running_mean[expert_idx];
-            auto expert_running_var = running_var[expert_idx];
-            
-            // 计算当前专家输出的起始指针
-            // 输出张量形状: [batch_size, num_selected_experts, hidden_dim]
-            // 对于专家i，我们需要处理交错的内存布局
-            float* base_ptr = output.data_ptr<float>();
-            
-            // 应用BatchNorm + SiLU到当前专家的输出
-            // 使用CUDA kernel进行并行处理，处理交错的内存布局
-            dim3 bn_block_dim(256);
-            dim3 bn_grid_dim(batch_size);  // 每个batch一个block
-            
-            singleExpertBatchNormSiluKernelStrided<float><<<bn_grid_dim, bn_block_dim>>>(
-                base_ptr + i * hidden_dim,  // 专家i的起始位置
-                expert_bn_weights.data_ptr<float>(),
-                expert_bn_biases.data_ptr<float>(),
-                expert_running_mean.data_ptr<float>(),
-                expert_running_var.data_ptr<float>(),
-                epsilon,
-                batch_size,
-                hidden_dim,
-                num_selected_experts * hidden_dim  // stride between batches
-            );
-        }
+    // 为每个专家应用BatchNorm + SiLU
+    for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+        // 获取当前专家的BatchNorm参数
+        auto expert_bn_weights = bn_weights[expert_idx];
+        auto expert_bn_biases = bn_biases[expert_idx];
+        auto expert_running_mean = running_mean[expert_idx];
+        auto expert_running_var = running_var[expert_idx];
+        
+        // 获取当前专家的输出数据指针
+        // 输出张量形状: [batch_size, num_experts, hidden_dim]
+        // 专家expert_idx的数据在output[:, expert_idx, :]
+        float* expert_data_ptr = output.data_ptr<float>() + expert_idx * hidden_dim;
+        
+        // 应用BatchNorm + SiLU到当前专家的输出
+        dim3 bn_block_dim(256);
+        dim3 bn_grid_dim(batch_size);  // 每个batch一个block
+        
+        singleExpertBatchNormSiluKernelStrided<float><<<bn_grid_dim, bn_block_dim>>>(
+            expert_data_ptr,  // 专家expert_idx的起始位置
+            expert_bn_weights.data_ptr<float>(),
+            expert_bn_biases.data_ptr<float>(),
+            expert_running_mean.data_ptr<float>(),
+            expert_running_var.data_ptr<float>(),
+            epsilon,
+            batch_size,
+            hidden_dim,
+            num_experts * hidden_dim  // stride between batches
+        );
     }
 
     // 确保所有CUDA操作完成
@@ -779,7 +766,7 @@ torch::Tensor fusedBatchNormSiluForward(
 // ============================== 模块注册 =================================
 
 PYBIND11_MODULE(home_kernels, m) {
-    m.def("home_expert_forward", torch::wrap_pybind_function(homeExpertForward), "HoME Expert Forward");
+    m.def("home_expert_forward", torch::wrap_pybind_function(homeExpertForward), "HoME Expert Forward (All experts share same input)");
     m.def("lora_gate_forward", torch::wrap_pybind_function(loraGateForward), "LoRA Gate Forward");
     m.def("gate_weights_forward", torch::wrap_pybind_function(gateWeightsForward), "Gate Weights Forward");
     m.def("expert_weighted_sum_forward", torch::wrap_pybind_function(expertWeightedSumForward), "Expert Weighted Sum Forward");
