@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-准确的专家前向传播对比测试
+简化的专家前向传播性能对比测试
+只对比纯计算部分，不包含数据拷贝开销
 
-完全复刻HoME.py中的专家计算逻辑，对比：
-1. CUDA Kernel实现 (home_kernels.home_expert_forward)
-2. HoME.py中的实际for循环实现 (Sequential(MLPLayer, BatchNorm, SiLU))
-
-HoME模型结构理解：
-- 专家输入维度: meta_output_dim = dim * 2
-- 专家输出维度: dim
-- 专家网络: MLPLayer(meta_output_dim, [dim], activate="relu")
-- 完整结构: Sequential(MLPLayer, BatchNorm1d, SiLU)
+对比项目：
+1. CUDA Kernel实现
+2. PyTorch纯计算版本 
+3. PyTorch纯计算版本 + torch.compile
 """
 
 import torch
@@ -36,7 +32,6 @@ except ImportError as e:
 
 # 导入HoME相关模块
 try:
-    from MLP import MLPLayer
     from Dense import DenseLayer
     HOME_AVAILABLE = True
     print("✓ HoME模块导入成功")
@@ -45,178 +40,108 @@ except ImportError as e:
     HOME_AVAILABLE = False
 
 
-def create_home_expert_sequential(input_data, expert_mlp_weights, expert_biases, expert_indices, 
-                                meta_output_dim, dim, num_experts, use_bias=True):
+# PyTorch纯计算版本
+def pytorch_expert_forward(input_data, expert_networks):
     """
-    完全复刻HoME.py中的专家计算逻辑
-    使用Sequential(MLPLayer, BatchNorm, SiLU)结构
-    
-    Args:
-        input_data: [batch_size, meta_output_dim] - 专家输入（来自Meta层）
-        expert_mlp_weights: [num_experts, meta_output_dim, dim] - MLP层权重
-        expert_biases: [num_experts, dim] - MLP层偏置
-        expert_indices: [num_selected_experts] - 选中的专家索引
-        meta_output_dim: Meta层输出维度 = dim * 2
-        dim: 专家输出维度
-        num_experts: 专家总数
+    PyTorch纯计算版本 - 预先创建好网络层，只测试前向计算
     """
     batch_size = input_data.size(0)
-    num_selected_experts = expert_indices.size(0)
+    num_experts = len(expert_networks)
+    dim = expert_networks[0]['fc2'].linear.out_features
     
-    # 分配输出内存
-    output = torch.zeros(batch_size, num_selected_experts, dim, 
-                       device=input_data.device, dtype=input_data.dtype)
-    
-    # 完全复刻HoME.py中的专家计算逻辑
-    for i, expert_idx in enumerate(expert_indices):
-        expert_idx = expert_idx.item()
-        if expert_idx < num_experts:
-            # 创建专家网络，完全按照HoME.py中的结构
-            # 1. MLPLayer(meta_output_dim, [dim], activate="relu")
-            expert_mlp = MLPLayer(meta_output_dim, [dim], activate="relu", name=f"expert_{expert_idx}")
-            
-            # 2. BatchNorm1d
-            batch_norm = nn.BatchNorm1d(dim)
-            
-            # 3. SiLU激活函数
-            silu_activation = nn.SiLU()
-            
-            # 设置MLP层权重和偏置
-            with torch.no_grad():
-                # expert_mlp_weights[expert_idx] 的形状是 [meta_output_dim, dim]
-                # MLPLayer内部只有一个Linear层，权重形状是 [dim, meta_output_dim]
-                expert_mlp.linears[0].linear.weight.data.copy_(expert_mlp_weights[expert_idx].t())
-                if use_bias and expert_biases is not None:
-                    expert_mlp.linears[0].linear.bias.data.copy_(expert_biases[expert_idx])
-            
-            # 移动到正确的设备
-            expert_mlp = expert_mlp.to(input_data.device)
-            batch_norm = batch_norm.to(input_data.device)
-            
-            # 设置为评估模式，确保使用running_mean和running_var
-            batch_norm.eval()
-            
-            # 按照HoME.py中的顺序执行：MLP -> BatchNorm -> SiLU
-            expert_output = expert_mlp(input_data)  # MLPLayer
-            expert_output = batch_norm(expert_output)  # BatchNorm (使用running stats)
-            expert_output = silu_activation(expert_output)  # SiLU激活
-            
-            # 存储到输出张量中
-            output[:, i, :] = expert_output
-    
-    return output
-
-
-def create_home_expert_sequential_with_bn(input_data, expert_mlp_weights, expert_biases, 
-                                        bn_weights, bn_biases, running_mean, running_var, 
-                                        meta_output_dim, dim, num_experts, use_bias=True, epsilon=1e-5):
-    """
-    HoME架构的专家计算逻辑，使用指定的BatchNorm参数
-    HoME特点：所有专家共享相同输入，但有不同的权重
-    使用Sequential(MLPLayer, BatchNorm, SiLU)结构
-    
-    Args:
-        input_data: [batch_size, meta_output_dim] - 专家输入（所有专家共享）
-        expert_mlp_weights: [num_experts, meta_output_dim, dim] - MLP层权重
-        expert_biases: [num_experts, dim] - MLP层偏置
-        bn_weights: [num_experts, dim] - BatchNorm权重
-        bn_biases: [num_experts, dim] - BatchNorm偏置
-        running_mean: [num_experts, dim] - BatchNorm运行均值
-        running_var: [num_experts, dim] - BatchNorm运行方差
-        meta_output_dim: Meta层输出维度 = dim * 2
-        dim: 专家输出维度
-        num_experts: 专家总数
-    """
-    batch_size = input_data.size(0)
-    
-    # HoME架构：输出形状为 [batch_size, num_experts, dim]
     output = torch.zeros(batch_size, num_experts, dim, 
                        device=input_data.device, dtype=input_data.dtype)
     
-    # HoME架构：所有专家都处理相同的输入
-    for expert_idx in range(num_experts):
-        # 创建专家网络，完全按照HoME.py中的结构
-        # 1. MLPLayer(meta_output_dim, [dim], activate="relu")
-        expert_mlp = MLPLayer(meta_output_dim, [dim], activate="relu", name=f"expert_{expert_idx}")
+    for expert_idx, expert_net in enumerate(expert_networks):
+        fc1 = expert_net['fc1']
+        fc2 = expert_net['fc2']
+        batch_norm = expert_net['batch_norm']
+        silu_activation = expert_net['silu']
         
-        # 2. BatchNorm1d - 使用指定的参数
-        batch_norm = nn.BatchNorm1d(dim)
+        expert_output = fc1(input_data)
+        expert_output = fc2(expert_output)
+        expert_output = batch_norm(expert_output)
+        expert_output = silu_activation(expert_output)
         
-        # 3. SiLU激活函数
-        silu_activation = nn.SiLU()
-        
-        # 设置MLP层权重和偏置
-        with torch.no_grad():
-            # expert_mlp_weights[expert_idx] 的形状是 [meta_output_dim, dim]
-            # MLPLayer内部只有一个Linear层，权重形状是 [dim, meta_output_dim]
-            expert_mlp.linears[0].linear.weight.data.copy_(expert_mlp_weights[expert_idx].t())
-            if use_bias and expert_biases is not None:
-                expert_mlp.linears[0].linear.bias.data.copy_(expert_biases[expert_idx])
-            
-            # 设置BatchNorm参数
-            batch_norm.weight.data.copy_(bn_weights[expert_idx])
-            batch_norm.bias.data.copy_(bn_biases[expert_idx])
-            batch_norm.running_mean.data.copy_(running_mean[expert_idx])
-            batch_norm.running_var.data.copy_(running_var[expert_idx])
-        
-        # 移动到正确的设备
-        expert_mlp = expert_mlp.to(input_data.device)
-        batch_norm = batch_norm.to(input_data.device)
-        
-        # 设置为评估模式，确保使用running_mean和running_var而不是当前批次的统计信息
-        batch_norm.eval()
-        
-        # 按照HoME.py中的顺序执行：MLP -> BatchNorm -> SiLU
-        expert_output = expert_mlp(input_data)  # MLPLayer
-        expert_output = batch_norm(expert_output)  # BatchNorm (使用running stats)
-        expert_output = silu_activation(expert_output)  # SiLU激活
-        
-        # 存储到输出张量中：HoME架构中expert_idx就是输出的第二个维度索引
         output[:, expert_idx, :] = expert_output
     
     return output
 
 
-def create_simple_linear_expert(input_data, expert_mlp_weights, expert_biases, expert_indices, 
-                                meta_output_dim, dim, num_experts, use_bias=True):
+# PyTorch纯计算版本 + torch.compile
+@torch.compile
+def pytorch_expert_forward_compiled(input_data, expert_networks):
     """
-    简化的线性专家实现（仅用于对比）
-    只使用Linear层，不包含BatchNorm和SiLU
-    
-    Args:
-        input_data: [batch_size, meta_output_dim] - 专家输入（来自Meta层）
-        expert_mlp_weights: [num_experts, meta_output_dim, dim] - MLP层权重
-        expert_biases: [num_experts, dim] - MLP层偏置
-        expert_indices: [num_selected_experts] - 选中的专家索引
-        meta_output_dim: Meta层输出维度 = dim * 2
-        dim: 专家输出维度
-        num_experts: 专家总数
+    PyTorch纯计算版本 + torch.compile优化
     """
     batch_size = input_data.size(0)
-    num_selected_experts = expert_indices.size(0)
+    num_experts = len(expert_networks)
+    dim = expert_networks[0]['fc2'].linear.out_features
     
-    # 分配输出内存
-    output = torch.zeros(batch_size, num_selected_experts, dim, 
+    output = torch.zeros(batch_size, num_experts, dim, 
                        device=input_data.device, dtype=input_data.dtype)
     
-    # 简化的线性计算
-    for i, expert_idx in enumerate(expert_indices):
-        expert_idx = expert_idx.item()
-        if expert_idx < num_experts:
-            # 获取当前专家的权重和偏置
-            expert_weight = expert_mlp_weights[expert_idx]  # [meta_output_dim, dim]
-            expert_bias = expert_biases[expert_idx] if use_bias else None  # [dim]
-            
-            # 计算专家输出: input @ weight + bias
-            expert_output = torch.matmul(input_data, expert_weight)  # [batch_size, dim]
-            
-            if use_bias and expert_bias is not None:
-                expert_output = expert_output + expert_bias.unsqueeze(0)  # 广播偏置
-            
-            # 存储到输出张量中
-            output[:, i, :] = expert_output
+    for expert_idx, expert_net in enumerate(expert_networks):
+        fc1 = expert_net['fc1']
+        fc2 = expert_net['fc2']
+        batch_norm = expert_net['batch_norm']
+        silu_activation = expert_net['silu']
+        
+        expert_output = fc1(input_data)
+        expert_output = fc2(expert_output)
+        expert_output = batch_norm(expert_output)
+        expert_output = silu_activation(expert_output)
+        
+        output[:, expert_idx, :] = expert_output
     
     return output
+
+
+def prepare_expert_networks(expert_mlp_weights_fc1, expert_biases_fc1,
+                           expert_mlp_weights_fc2, expert_biases_fc2,
+                           bn_weights, bn_biases, running_mean, running_var,
+                           meta_output_dim, dim, num_experts, device, use_bias=True):
+    """
+    预先创建和配置所有专家网络（这部分不计入性能测试）
+    """
+    print("  正在预先创建专家网络...")
+    expert_networks = []
+    
+    for expert_idx in range(num_experts):
+        hidden_dim = expert_mlp_weights_fc1.shape[2]
+        
+        # 创建网络层
+        fc1 = DenseLayer(meta_output_dim, hidden_dim, activation="relu", name=f"expert_fc1_{expert_idx}")
+        fc2 = DenseLayer(hidden_dim, dim, activation=None, name=f"expert_fc2_{expert_idx}")
+        batch_norm = nn.BatchNorm1d(dim)
+        silu_activation = nn.SiLU()
+        
+        # 设置权重和偏置
+        with torch.no_grad():
+            fc1.linear.weight.data.copy_(expert_mlp_weights_fc1[expert_idx].t())
+            if use_bias: fc1.linear.bias.data.copy_(expert_biases_fc1[expert_idx])
+            fc2.linear.weight.data.copy_(expert_mlp_weights_fc2[expert_idx].t())
+            if use_bias: fc2.linear.bias.data.copy_(expert_biases_fc2[expert_idx])
+            batch_norm.weight.data.copy_(bn_weights[expert_idx])
+            batch_norm.bias.data.copy_(bn_biases[expert_idx])
+            batch_norm.running_mean.data.copy_(running_mean[expert_idx])
+            batch_norm.running_var.data.copy_(running_var[expert_idx])
+        
+        # 移动到设备并设置为评估模式
+        fc1 = fc1.to(device)
+        fc2 = fc2.to(device)
+        batch_norm = batch_norm.to(device)
+        batch_norm.eval()
+        
+        expert_networks.append({
+            'fc1': fc1,
+            'fc2': fc2,
+            'batch_norm': batch_norm,
+            'silu': silu_activation
+        })
+    
+    print("  ✓ 专家网络创建完成")
+    return expert_networks
 
 
 def run_performance_test(func, num_runs=10, warmup_runs=3):
@@ -258,9 +183,9 @@ def run_performance_test(func, num_runs=10, warmup_runs=3):
 
 
 def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
-    """运行对比测试 - 高吞吐量测试用例"""
+    """运行简化的性能对比测试 - 只对比纯计算部分"""
     print(f"\n{'='*80}")
-    print(f"HoME vs CUDA 专家前向传播对比测试")
+    print(f"专家前向传播纯计算性能对比测试")
     print(f"配置: batch_size={batch_size}, dim={dim}, num_experts={num_experts}")
     print(f"HoME模型结构: meta_output_dim={dim*2}, expert_output_dim={dim}")
     print(f"{'='*80}")
@@ -279,40 +204,46 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
     
     # 专家输入来自Meta层，维度为meta_output_dim
     input_data = torch.randn(batch_size, meta_output_dim, device=device)
-    # 专家MLP权重: [num_experts, meta_output_dim, expert_output_dim]
-    expert_mlp_weights = torch.randn(num_experts, meta_output_dim, expert_output_dim, device=device)
-    # 专家MLP偏置: [num_experts, expert_output_dim]
-    expert_biases = torch.randn(num_experts, expert_output_dim, device=device)
-    expert_indices = torch.arange(num_experts, dtype=torch.int32, device=device)
     
-    # 创建BatchNorm参数 - 确保所有实现使用相同的参数
+    # 创建权重和偏置
+    expert_mlp_weights_fc1 = torch.randn(num_experts, meta_output_dim, expert_output_dim, device=device)
+    expert_biases_fc1 = torch.randn(num_experts, expert_output_dim, device=device)
+    expert_mlp_weights_fc2 = torch.randn(num_experts, expert_output_dim, expert_output_dim, device=device)
+    expert_biases_fc2 = torch.randn(num_experts, expert_output_dim, device=device)
+    
+    # BatchNorm参数
     bn_weights = torch.randn(num_experts, expert_output_dim, device=device)
     bn_biases = torch.randn(num_experts, expert_output_dim, device=device)
     running_mean = torch.randn(num_experts, expert_output_dim, device=device)
-    running_var = torch.ones(num_experts, expert_output_dim, device=device)  # 确保方差为正
+    running_var = torch.ones(num_experts, expert_output_dim, device=device)
     
-    print(f"数据形状验证:")
+    print(f"\n数据形状验证:")
     print(f"  input_data: {input_data.shape}")
-    print(f"  expert_mlp_weights: {expert_mlp_weights.shape}")
-    print(f"  expert_biases: {expert_biases.shape}")
-    print(f"  expert_indices: {expert_indices.shape}")
-    print(f"  bn_weights: {bn_weights.shape}")
-    print(f"  bn_biases: {bn_biases.shape}")
-    print(f"  running_mean: {running_mean.shape}")
-    print(f"  running_var: {running_var.shape}")
+    print(f"  expert_mlp_weights_fc1: {expert_mlp_weights_fc1.shape}")
+    print(f"  expert_mlp_weights_fc2: {expert_mlp_weights_fc2.shape}")
     
     results = {}
     
+    # 预先创建专家网络（不计入性能测试）
+    print(f"\n准备阶段:")
+    expert_networks = prepare_expert_networks(
+        expert_mlp_weights_fc1, expert_biases_fc1,
+        expert_mlp_weights_fc2, expert_biases_fc2,
+        bn_weights, bn_biases, running_mean, running_var,
+        meta_output_dim, expert_output_dim, num_experts, device, True
+    )
+    
     # 1. CUDA Kernel实现
     if CUDA_KERNELS_AVAILABLE:
-        print(f"\n1. CUDA Kernel实现 (home_kernels.home_expert_forward)")
+        print(f"\n1. CUDA Kernel实现")
         print("-" * 60)
         
         try:
-            # 测试CUDA kernel（集成BatchNorm和SiLU）
             with torch.no_grad():
                 cuda_output = home_kernels.home_expert_forward(
-                    input_data, expert_mlp_weights, expert_biases,
+                    input_data, 
+                    expert_mlp_weights_fc1, expert_biases_fc1,
+                    expert_mlp_weights_fc2, expert_biases_fc2,
                     bn_weights, bn_biases, running_mean, running_var,
                     num_experts, True, 1e-5
                 )
@@ -323,7 +254,9 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
             # 性能测试
             def cuda_func():
                 return home_kernels.home_expert_forward(
-                    input_data, expert_mlp_weights, expert_biases,
+                    input_data, 
+                    expert_mlp_weights_fc1, expert_biases_fc1,
+                    expert_mlp_weights_fc2, expert_biases_fc2,
                     bn_weights, bn_biases, running_mean, running_var,
                     num_experts, True, 1e-5
                 )
@@ -343,62 +276,83 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
         except Exception as e:
             print(f"✗ CUDA kernel执行失败: {e}")
             results['cuda'] = None
-    
-    # 2. HoME.py中的实际实现 (Sequential结构)
-    print(f"\n2. HoME.py实际实现 (Sequential(MLPLayer, BatchNorm, SiLU))")
+
+    # 2. PyTorch纯计算版本
+    print(f"\n2. PyTorch纯计算版本")
     print("-" * 60)
     
     try:
-        # 测试HoME.py的实际实现 - 使用与CUDA kernel相同的参数
         with torch.no_grad():
-            home_output = create_home_expert_sequential_with_bn(
-                input_data, expert_mlp_weights, expert_biases, 
-                bn_weights, bn_biases, running_mean, running_var, 
-                meta_output_dim, expert_output_dim, num_experts, True
-            )
+            pytorch_output = pytorch_expert_forward(input_data, expert_networks)
         
-        print(f"✓ HoME.py实际实现执行成功")
-        print(f"  输出形状: {home_output.shape}")
+        print(f"✓ PyTorch纯计算版本执行成功")
+        print(f"  输出形状: {pytorch_output.shape}")
         
         # 性能测试
-        def home_func():
-            return create_home_expert_sequential_with_bn(
-                input_data, expert_mlp_weights, expert_biases, 
-                bn_weights, bn_biases, running_mean, running_var, 
-                meta_output_dim, expert_output_dim, num_experts, True
-            )
+        def pytorch_func():
+            return pytorch_expert_forward(input_data, expert_networks)
         
-        home_perf = run_performance_test(home_func, num_runs)
+        pytorch_perf = run_performance_test(pytorch_func, num_runs)
         print(f"  性能统计:")
-        print(f"    平均时间: {home_perf['avg_time']:.4f} ms")
-        print(f"    最小时间: {home_perf['min_time']:.4f} ms")
-        print(f"    最大时间: {home_perf['max_time']:.4f} ms")
-        print(f"    标准差: {home_perf['std_time']:.4f} ms")
+        print(f"    平均时间: {pytorch_perf['avg_time']:.4f} ms")
+        print(f"    最小时间: {pytorch_perf['min_time']:.4f} ms")
+        print(f"    最大时间: {pytorch_perf['max_time']:.4f} ms")
+        print(f"    标准差: {pytorch_perf['std_time']:.4f} ms")
         
-        results['home'] = {
-            'output': home_output,
-            'performance': home_perf
+        results['pytorch'] = {
+            'output': pytorch_output,
+            'performance': pytorch_perf
         }
         
     except Exception as e:
-        print(f"✗ HoME.py实际实现执行失败: {e}")
-        results['home'] = None
-    
-    
-    # 3. 精度对比分析
-    print(f"\n3. 精度对比分析")
+        print(f"✗ PyTorch纯计算版本执行失败: {e}")
+        results['pytorch'] = None
+
+    # 3. PyTorch纯计算版本 + torch.compile
+    print(f"\n3. PyTorch纯计算版本 + torch.compile")
     print("-" * 60)
     
-    if results.get('cuda') and results.get('home'):
+    try:
+        with torch.no_grad():
+            pytorch_compiled_output = pytorch_expert_forward_compiled(input_data, expert_networks)
+        
+        print(f"✓ PyTorch+torch.compile版本执行成功")
+        print(f"  输出形状: {pytorch_compiled_output.shape}")
+        
+        # 性能测试
+        def pytorch_compiled_func():
+            return pytorch_expert_forward_compiled(input_data, expert_networks)
+        
+        pytorch_compiled_perf = run_performance_test(pytorch_compiled_func, num_runs)
+        print(f"  性能统计:")
+        print(f"    平均时间: {pytorch_compiled_perf['avg_time']:.4f} ms")
+        print(f"    最小时间: {pytorch_compiled_perf['min_time']:.4f} ms")
+        print(f"    最大时间: {pytorch_compiled_perf['max_time']:.4f} ms")
+        print(f"    标准差: {pytorch_compiled_perf['std_time']:.4f} ms")
+        
+        results['pytorch_compiled'] = {
+            'output': pytorch_compiled_output,
+            'performance': pytorch_compiled_perf
+        }
+        
+    except Exception as e:
+        print(f"✗ PyTorch+torch.compile版本执行失败: {e}")
+        results['pytorch_compiled'] = None
+    
+    # 4. 精度对比分析
+    print(f"\n4. 精度对比分析")
+    print("-" * 60)
+    
+    if results.get('cuda') and results.get('pytorch'):
         cuda_output = results['cuda']['output']
-        home_output = results['home']['output']
+        pytorch_output = results['pytorch']['output']
         
         # 计算数值差异
-        diff = torch.abs(cuda_output - home_output)
+        diff = torch.abs(cuda_output - pytorch_output)
         max_diff = torch.max(diff).item()
         mean_diff = torch.mean(diff).item()
         
-        print(f"CUDA Kernel vs HoME.py实际实现:")
+        print(f"CUDA Kernel vs PyTorch:")
         print(f"  最大差异: {max_diff:.6f}")
         print(f"  平均差异: {mean_diff:.6f}")
         
@@ -406,28 +360,59 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
             print(f"  ✓ 数值精度验证通过")
         else:
             print(f"  ⚠️  数值精度可能存在差异")
-    else:
-        print("⚠️  无法进行精度对比，某些实现失败")
     
-    # 4. 性能对比分析
-    print(f"\n4. 性能对比分析")
+    # 验证torch.compile版本的精度
+    if results.get('pytorch') and results.get('pytorch_compiled'):
+        pytorch_output = results['pytorch']['output']
+        pytorch_compiled_output = results['pytorch_compiled']['output']
+        
+        # 计算数值差异
+        diff = torch.abs(pytorch_output - pytorch_compiled_output)
+        max_diff = torch.max(diff).item()
+        mean_diff = torch.mean(diff).item()
+        
+        print(f"\nPyTorch vs PyTorch+torch.compile:")
+        print(f"  最大差异: {max_diff:.6f}")
+        print(f"  平均差异: {mean_diff:.6f}")
+        
+        if max_diff < 1e-6:
+            print(f"  ✓ torch.compile版本数值精度验证通过")
+        else:
+            print(f"  ⚠️  torch.compile版本可能存在数值差异")
+    
+    # 5. 性能对比分析
+    print(f"\n5. 性能对比分析")
     print("-" * 60)
     
-    if results.get('cuda') and results.get('home'):
-        cuda_time = results['cuda']['performance']['avg_time']
-        home_time = results['home']['performance']['avg_time']
-        speedup = home_time / cuda_time
-        
-        print(f"CUDA Kernel vs HoME.py实际实现:")
-        print(f"  CUDA Kernel: {cuda_time:.4f} ms")
-        print(f"  HoME.py实际实现: {home_time:.4f} ms")
-        print(f"  加速比: {speedup:.2f}x {'(CUDA更快)' if speedup > 1 else '(HoME.py更快)'}")
-    else:
-        print("⚠️  无法进行性能对比，某些实现失败")
+    # 收集所有性能数据
+    perf_data = []
+    if results.get('cuda'):
+        perf_data.append(('CUDA Kernel', results['cuda']['performance']['avg_time']))
+    if results.get('pytorch'):
+        perf_data.append(('PyTorch', results['pytorch']['performance']['avg_time']))
+    if results.get('pytorch_compiled'):
+        perf_data.append(('PyTorch+torch.compile', results['pytorch_compiled']['performance']['avg_time']))
     
-    # 5. GPU内存使用
+    # 排序并显示
+    perf_data.sort(key=lambda x: x[1])
+    
+    print("性能排名（从快到慢）:")
+    for i, (name, time_ms) in enumerate(perf_data, 1):
+        fastest_time = perf_data[0][1]
+        speedup = time_ms / fastest_time
+        print(f"  {i}. {name}: {time_ms:.4f} ms ({speedup:.2f}x)")
+    
+    # 详细对比
+    if len(perf_data) >= 2:
+        print(f"\n详细对比:")
+        fastest_name, fastest_time = perf_data[0]
+        for name, time_ms in perf_data[1:]:
+            speedup = time_ms / fastest_time
+            print(f"  {fastest_name} vs {name}: {speedup:.2f}x 加速")
+    
+    # 6. GPU内存使用
     if torch.cuda.is_available():
-        print(f"\n5. GPU内存使用")
+        print(f"\n6. GPU内存使用")
         print("-" * 60)
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
@@ -438,9 +423,10 @@ def run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10):
 
 
 def main():
-    """主函数 - 高吞吐量测试用例"""
-    print("HoME vs CUDA 专家前向传播对比测试")
+    """主函数"""
+    print("专家前向传播纯计算性能对比测试")
     print("=" * 60)
+    print("注意：此测试只对比纯计算部分，不包含数据拷贝开销")
     
     # 检查CUDA可用性
     if torch.cuda.is_available():
@@ -449,18 +435,18 @@ def main():
     else:
         print("警告: CUDA不可用，将使用CPU运行")
     
-    # 运行高吞吐量测试用例
-    print(f"\n{'='*80}")
-    print(f"高吞吐量测试用例")
-    print(f"{'='*80}")
-    
+    # 运行对比测试
     results = run_comparison(batch_size=4096, dim=700, num_experts=5, num_runs=10)
     
     # 清理内存
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    print("\n✅ 对比测试完成!")
+    print("\n✅ 纯计算性能对比测试完成!")
+    print("\n总结:")
+    print("- 此测试排除了数据拷贝开销，只对比实际计算性能")
+    print("- 结果更能反映各种实现的真实计算效率")
+    print("- 适合用于算法优化和性能调优的参考")
 
 
 if __name__ == "__main__":

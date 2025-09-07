@@ -32,3 +32,6 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${CUDA_INCLUDE_DIRS})
 target_include_directories(${PROJECT_NAME} PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass/include")
 target_include_directories(${PROJECT_NAME} PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass/tools/util/include")
 target_include_directories(${PROJECT_NAME} PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass_extensions/include")
+
+# Add test subdirectory
+add_subdirectory(test)
