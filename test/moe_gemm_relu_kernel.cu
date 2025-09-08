@@ -16,6 +16,7 @@
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/epilogue/thread/linear_combination_relu.h"
+#include "cutlass/bfloat16.h"
 #include "cutlass_extensions/epilogue_helpers.h"
 #include "cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
 #include "cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h"
@@ -63,12 +64,14 @@ void moeGemmKernelLauncherImpl(const T* A, const WeightType* B, const T* weight_
     const int multi_processor_count)
 {
     // The cutlass type for the input elements. This is needed to convert to cutlass::half_t if necessary.
-    using ElementType =
-        typename cutlass::platform::conditional<cutlass::platform::is_same<T, half>::value, cutlass::half_t, T>::type;
+    // For BF16, we directly use cutlass::bfloat16_t as the input type
+    using ElementType = typename cutlass::platform::conditional<
+        cutlass::platform::is_same<T, half>::value, cutlass::half_t, T
+    >::type;
 
-    using CutlassWeightType =
-        typename cutlass::platform::conditional<cutlass::platform::is_same<WeightType, half>::value, cutlass::half_t,
-            WeightType>::type;
+    using CutlassWeightType = typename cutlass::platform::conditional<
+        cutlass::platform::is_same<WeightType, half>::value, cutlass::half_t, WeightType
+    >::type;
 
     // We need separate config for each architecture since we will target different tensorcore instructions. For float,
     // we do not target TCs.
@@ -203,6 +206,79 @@ void launch_moe_gemm_kernel(
     moeGemmKernelLauncherImpl<float, float, cutlass::arch::Sm80, EpilogueOpDefault,
                               cutlass::gemm::GemmShape<128, 128, 8>,
                               cutlass::gemm::GemmShape<64, 64, 8>, 2>(
+        input,
+        weights,
+        nullptr, // weight_scales
+        use_bias ? biases : nullptr,
+        output,
+        const_cast<int64_t*>(expert_offsets),
+        total_tokens,     // num_rows
+        output_dim,       // gemm_n
+        input_dim,        // gemm_k
+        num_experts,
+        multi_processor_count
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+}
+
+// BF16版本的MoE GEMM kernel
+void launch_moe_gemm_relu_kernel_bf16(
+    const cutlass::bfloat16_t* input,           // [total_tokens, input_dim]
+    const cutlass::bfloat16_t* weights,         // [num_experts, input_dim, output_dim]
+    const cutlass::bfloat16_t* biases,          // [num_experts, output_dim] or nullptr
+    cutlass::bfloat16_t* output,                // [total_tokens, output_dim]
+    const int64_t* expert_offsets, // [num_experts + 1] - cumulative token counts
+    int num_experts,
+    int total_tokens,
+    int input_dim,
+    int output_dim,
+    bool use_bias
+) {
+    // 获取GPU多处理器数量
+    int multi_processor_count;
+    CHECK_CUDA(cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0));
+
+    // 启动MoE GEMM ReLU kernel (BF16兼容配置)
+    moeGemmKernelLauncherImpl<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::arch::Sm80, EpilogueOpReLU,
+                              cutlass::gemm::GemmShape<256, 128, 32>,
+                              cutlass::gemm::GemmShape<64, 64, 32>, 4>(
+        input,
+        weights,
+        nullptr, // weight_scales
+        use_bias ? biases : nullptr,
+        output,
+        const_cast<int64_t*>(expert_offsets),
+        total_tokens,     // num_rows
+        output_dim,       // gemm_n
+        input_dim,        // gemm_k
+        num_experts,
+        multi_processor_count
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void launch_moe_gemm_kernel_bf16(
+    const cutlass::bfloat16_t* input,           // [total_tokens, input_dim]
+    const cutlass::bfloat16_t* weights,         // [num_experts, input_dim, output_dim]
+    const cutlass::bfloat16_t* biases,          // [num_experts, output_dim] or nullptr
+    cutlass::bfloat16_t* output,                // [total_tokens, output_dim]
+    const int64_t* expert_offsets, // [num_experts + 1] - cumulative token counts
+    int num_experts,
+    int total_tokens,
+    int input_dim,
+    int output_dim,
+    bool use_bias
+) {
+    // 获取GPU多处理器数量
+    int multi_processor_count;
+    CHECK_CUDA(cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0));
+
+    // 启动MoE GEMM kernel (BF16兼容配置)
+    moeGemmKernelLauncherImpl<cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::arch::Sm80, EpilogueOpDefault,
+                              cutlass::gemm::GemmShape<256, 128, 32>,
+                              cutlass::gemm::GemmShape<64, 64, 32>, 4>(
         input,
         weights,
         nullptr, // weight_scales

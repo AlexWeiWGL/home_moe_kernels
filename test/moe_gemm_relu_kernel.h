@@ -6,6 +6,7 @@
 #define MOE_GEMM_RELU_KERNEL_H
 
 #include <cstdint>
+#include "cutlass/bfloat16.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,6 +73,38 @@ void launch_simple_gemm_relu(
     int M,
     int N,
     int K,
+    bool use_bias
+);
+
+/**
+ * 启动MoE GEMM ReLU kernel (BF16版本)
+ */
+void launch_moe_gemm_relu_kernel_bf16(
+    const cutlass::bfloat16_t* input,
+    const cutlass::bfloat16_t* weights,
+    const cutlass::bfloat16_t* biases,
+    cutlass::bfloat16_t* output,
+    const int64_t* expert_offsets,
+    int num_experts,
+    int total_tokens,
+    int input_dim,
+    int output_dim,
+    bool use_bias
+);
+
+/**
+ * 启动MoE GEMM kernel (不带ReLU, BF16版本)
+ */
+void launch_moe_gemm_kernel_bf16(
+    const cutlass::bfloat16_t* input,
+    const cutlass::bfloat16_t* weights,
+    const cutlass::bfloat16_t* biases,
+    cutlass::bfloat16_t* output,
+    const int64_t* expert_offsets,
+    int num_experts,
+    int total_tokens,
+    int input_dim,
+    int output_dim,
     bool use_bias
 );
 

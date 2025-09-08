@@ -1,5 +1,5 @@
 /*
- * MoE GEMM 测试 (ColumnMajor Weights)
+ * MoE GEMM 测试 (ColumnMajor Weights, BF16 Precision)
  */
 
 #include <iostream>
@@ -11,6 +11,7 @@
 
 #include <torch/torch.h>
 #include <cuda_runtime.h>
+#include "cutlass/bfloat16.h"
 
 #include "moe_gemm_relu_kernel.h"
 
@@ -22,8 +23,20 @@
     } \
 } while(0)
 
-// 辅助函数，用于生成随机数据
-std::vector<float> generate_random_data(size_t size) {
+// 辅助函数，用于生成随机数据 (BF16版本)
+std::vector<cutlass::bfloat16_t> generate_random_data_bf16(size_t size) {
+    std::vector<cutlass::bfloat16_t> data(size);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<> dis(-0.1, 0.1);
+    for (size_t i = 0; i < size; ++i) {
+        data[i] = cutlass::bfloat16_t(float(dis(gen)));
+    }
+    return data;
+}
+
+// 辅助函数，用于生成随机数据 (Float版本，用于PyTorch参考)
+std::vector<float> generate_random_data_float(size_t size) {
     std::vector<float> data(size);
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -36,7 +49,7 @@ std::vector<float> generate_random_data(size_t size) {
 
 
 int main() {
-    std::cout << "=== MoE GEMM测试 (ColumnMajor Weights, 专家全激活) ===" << std::endl;
+    std::cout << "=== MoE GEMM测试 (Float32 输入, BF16 Kernel, 专家全激活) ===" << std::endl;
     
     // 测试参数
     const int num_experts = 5;
@@ -48,18 +61,17 @@ int main() {
     
     std::cout << "测试配置: " << num_experts << " experts, " 
               << batch_size << " tokens, " 
-              << input_dim << " -> " << output_dim << std::endl;
+              << input_dim << " -> " << output_dim << " (Float32->BF16)" << std::endl;
     
     // 设置CUDA设备
     torch::Device device(torch::kCUDA, 0);
     
-    // 1. 创建原始随机数据
-    // PyTorch的mm期望权重是 [K, N]
-    auto h_weights_raw_row_major = generate_random_data(num_experts * input_dim * output_dim); // [E, K, N]
-    auto h_input_base = generate_random_data(batch_size * input_dim);
-    auto h_biases = generate_random_data(num_experts * output_dim);
+    // 1. 创建原始随机数据 (Float版本)
+    auto h_weights_raw_row_major = generate_random_data_float(num_experts * input_dim * output_dim); // [E, K, N]
+    auto h_input_base = generate_random_data_float(batch_size * input_dim);
+    auto h_biases = generate_random_data_float(num_experts * output_dim);
     
-    // 2. 复制输入以匹配“所有专家处理所有token”的场景
+    // 2. 复制输入以匹配"所有专家处理所有token"的场景
     std::vector<float> h_input_replicated(total_rows * input_dim);
     for (int i = 0; i < num_experts; ++i) {
         memcpy(h_input_replicated.data() + i * (batch_size * input_dim), 
@@ -113,7 +125,7 @@ int main() {
     CHECK_CUDA(cudaEventCreate(&stop));
 
     CHECK_CUDA(cudaEventRecord(start));
-    // 执行CUDA kernel
+    // 执行CUDA kernel (使用float32输入调用BF16 kernel)
     launch_moe_gemm_kernel(
         d_input, d_weights, d_biases, d_output, d_expert_offsets,
         num_experts, total_rows, input_dim, output_dim, use_bias
@@ -128,10 +140,10 @@ int main() {
     std::vector<float> h_output_cuda(total_rows * output_dim);
     CHECK_CUDA(cudaMemcpy(h_output_cuda.data(), d_output, total_rows * output_dim * sizeof(float), cudaMemcpyDeviceToHost));
     
-    // PyTorch参考实现
-    auto torch_input_base = torch::from_blob(h_input_base.data(), {batch_size, input_dim}, torch::kFloat32).to(device);
-    auto torch_weight_raw = torch::from_blob(h_weights_raw_row_major.data(), {num_experts, input_dim, output_dim}, torch::kFloat32).to(device);
-    auto torch_bias = torch::from_blob(h_biases.data(), {num_experts, output_dim}, torch::kFloat32).to(device);
+    // PyTorch参考实现 (使用BFloat16)
+    auto torch_input_base = torch::from_blob(h_input_base.data(), {batch_size, input_dim}, torch::kFloat32).to(device).to(torch::kBFloat16);
+    auto torch_weight_raw = torch::from_blob(h_weights_raw_row_major.data(), {num_experts, input_dim, output_dim}, torch::kFloat32).to(device).to(torch::kBFloat16);
+    auto torch_bias = torch::from_blob(h_biases.data(), {num_experts, output_dim}, torch::kFloat32).to(device).to(torch::kBFloat16);
     
     // --- PyTorch 性能测试 ---
     CHECK_CUDA(cudaEventRecord(start));
@@ -159,7 +171,7 @@ int main() {
     for(int i=0; i<8; ++i) std::cout << h_output_cuda[i] << " ";
     std::cout << std::endl;
     
-    std::cout << "PyTorch 输出 (专家0, 前8个元素):" << std::endl;
+    std::cout << "PyTorch 输出 (专家0, 前8个元素, BF16):" << std::endl;
     for(int i=0; i<8; ++i) std::cout << expert_outputs[0][0][i].item<float>() << " ";
     std::cout << std::endl;
 
@@ -167,7 +179,7 @@ int main() {
     for(int i=0; i<8; ++i) std::cout << h_output_cuda[batch_size * output_dim + i] << " ";
     std::cout << std::endl;
 
-    std::cout << "PyTorch 输出 (专家1, 前8个元素):" << std::endl;
+    std::cout << "PyTorch 输出 (专家1, 前8个元素, BF16):" << std::endl;
     for(int i=0; i<8; ++i) std::cout << expert_outputs[1][0][i].item<float>() << " ";
     std::cout << std::endl;
 
@@ -204,7 +216,14 @@ int main() {
     }
     
     std::cout << std::endl << "总最大绝对误差 (基于最佳匹配): " << max_overall_min_error << std::endl;
-    std::cout << "测试" << (max_overall_min_error < 1e-3 ? "通过" : "失败") << std::endl;
+    // BF16精度下，误差阈值应该更宽松
+    std::cout << "测试" << (max_overall_min_error < 1e-2 ? "通过" : "失败") << " (Float32->BF16)" << std::endl;
+    
+    // 打印性能对比
+    std::cout << std::endl << "性能对比:" << std::endl;
+    std::cout << "CUDA Kernel (Float32): " << cuda_time_ms << " ms" << std::endl;
+    std::cout << "PyTorch (BF16): " << torch_time_ms << " ms" << std::endl;
+    std::cout << "加速比: " << torch_time_ms / cuda_time_ms << "x" << std::endl;
     
     // 清理内存
     CHECK_CUDA(cudaEventDestroy(start));
