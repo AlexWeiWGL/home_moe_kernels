@@ -32,12 +32,20 @@
 
 // ============================== Epilogue操作定义 =================================
 
+struct EpilogueOpDefault {};
 struct EpilogueOpReLU {};
 
 template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator, typename Op> 
 struct Epilogue {};
 
 constexpr auto DefaultScaleMode = cutlass::epilogue::thread::ScaleType::Default;
+
+template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator>
+struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, EpilogueOpDefault>
+{
+    using Op = cutlass::epilogue::thread::LinearCombination<ElementType, ElementsPerVectorAccess,
+        ElementAccumulator, ElementAccumulator, DefaultScaleMode>;
+};
 
 template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator>
 struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, EpilogueOpReLU>
@@ -50,7 +58,7 @@ struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, Epilog
 
 template <typename T, typename WeightType, typename arch, typename EpilogueTag, typename ThreadblockShape,
     typename WarpShape, int Stages>
-void moeGemmReluKernelLauncher(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
+void moeGemmKernelLauncherImpl(const T* A, const WeightType* B, const T* weight_scales, const T* biases, T* C,
     int64_t* total_rows_before_expert, int64_t num_rows, int64_t gemm_n, int64_t gemm_k, int num_experts,
     const int multi_processor_count)
 {
@@ -73,7 +81,7 @@ void moeGemmReluKernelLauncher(const T* A, const WeightType* B, const T* weight_
     // Finally, set up the kernel.
     using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGrouped<ElementType, cutlass::layout::RowMajor,
         cutlass::ComplexTransform::kNone, MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
-        typename MixedGemmArchTraits::LayoutB, cutlass::ComplexTransform::kNone,
+        cutlass::layout::ColumnMajor, cutlass::ComplexTransform::kNone,
         MixedGemmArchTraits::ElementsPerAccessB, ElementType, cutlass::layout::RowMajor, ElementAccumulator,
         typename MixedGemmArchTraits::OperatorClass, arch, ThreadblockShape, WarpShape,
         typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
@@ -95,10 +103,13 @@ void moeGemmReluKernelLauncher(const T* A, const WeightType* B, const T* weight_
 
     const int group_size = gemm_k;
     typename GemmGrouped::Arguments args(num_experts, threadblock_count, group_size, epilogue_op,
-        reinterpret_cast<const ElementType*>(A), reinterpret_cast<const CutlassWeightType*>(B),
-        reinterpret_cast<const ElementType*>(weight_scales), 
-        biases ? reinterpret_cast<const ElementType*>(biases) : nullptr, // ptr_C (bias)
-        reinterpret_cast<ElementType*>(C), total_rows_before_expert, gemm_n, gemm_k);
+        reinterpret_cast<const ElementType*>(A),
+        reinterpret_cast<const CutlassWeightType*>(B),
+        nullptr, // weight_scales
+        biases ? reinterpret_cast<const ElementType*>(biases) : nullptr, // ptr_C (biases)
+        reinterpret_cast<ElementType*>(C), // ptr_D (output)
+        total_rows_before_expert, 
+        gemm_n, gemm_k);
 
     GemmGrouped gemm;
 
@@ -131,6 +142,7 @@ void moeGemmReluKernelLauncher(const T* A, const WeightType* B, const T* weight_
     }
 }
 
+
 // ============================== C接口实现 =================================
 
 extern "C" {
@@ -152,7 +164,43 @@ void launch_moe_gemm_relu_kernel(
     CHECK_CUDA(cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0));
 
     // 启动MoE GEMM ReLU kernel
-    moeGemmReluKernelLauncher<float, float, cutlass::arch::Sm80, EpilogueOpReLU,
+    moeGemmKernelLauncherImpl<float, float, cutlass::arch::Sm80, EpilogueOpReLU,
+                              cutlass::gemm::GemmShape<128, 128, 8>,
+                              cutlass::gemm::GemmShape<64, 64, 8>, 2>(
+        input,
+        weights,
+        nullptr, // weight_scales
+        use_bias ? biases : nullptr,
+        output,
+        const_cast<int64_t*>(expert_offsets),
+        total_tokens,     // num_rows
+        output_dim,       // gemm_n
+        input_dim,        // gemm_k
+        num_experts,
+        multi_processor_count
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+}
+
+void launch_moe_gemm_kernel(
+    const float* input,           // [total_tokens, input_dim]
+    const float* weights,         // [num_experts, input_dim, output_dim]
+    const float* biases,          // [num_experts, output_dim] or nullptr
+    float* output,                // [total_tokens, output_dim]
+    const int64_t* expert_offsets, // [num_experts + 1] - cumulative token counts
+    int num_experts,
+    int total_tokens,
+    int input_dim,
+    int output_dim,
+    bool use_bias
+) {
+    // 获取GPU多处理器数量
+    int multi_processor_count;
+    CHECK_CUDA(cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0));
+
+    // 启动MoE GEMM kernel
+    moeGemmKernelLauncherImpl<float, float, cutlass::arch::Sm80, EpilogueOpDefault,
                               cutlass::gemm::GemmShape<128, 128, 8>,
                               cutlass::gemm::GemmShape<64, 64, 8>, 2>(
         input,

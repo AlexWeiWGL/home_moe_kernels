@@ -38,6 +38,22 @@ void launch_moe_gemm_relu_kernel(
 );
 
 /**
+ * 启动MoE GEMM kernel (不带ReLU)
+ */
+void launch_moe_gemm_kernel(
+    const float* input,
+    const float* weights,
+    const float* biases,
+    float* output,
+    const int64_t* expert_offsets,
+    int num_experts,
+    int total_tokens,
+    int input_dim,
+    int output_dim,
+    bool use_bias
+);
+
+/**
  * 简单的GEMM + ReLU实现（用于对比）
  * @param A 输入矩阵A [M, K]
  * @param B 权重矩阵B [K, N]
