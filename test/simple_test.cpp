@@ -93,9 +93,9 @@ int main() {
     }
 
     // 4. 计算专家负载（前缀和）
-    std::vector<int64_t> expert_offsets(num_experts + 1, 0);
-    for (int i = 0; i < num_experts; ++i) {
-        expert_offsets[i+1] = expert_offsets[i] + batch_size;
+    std::vector<int64_t> expert_offsets(num_experts, batch_size);
+    for (int i = 1; i < num_experts; ++i) {
+        expert_offsets[i] = expert_offsets[i-1] + batch_size;
     }
     
     std::cout << "输入数据形状 (replicated): [" << total_rows << ", " << input_dim << "]" << std::endl;

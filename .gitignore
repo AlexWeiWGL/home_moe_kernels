@@ -2,3 +2,5 @@
 __pycache__/
 build/
 home_kernels.egg-info/
+dist/
+home_kernels.cpython-312-x86_64-linux-gnu.so
