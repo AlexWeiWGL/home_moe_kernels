@@ -147,3 +147,52 @@ target_compile_features(test_bf16_vs_fp32 PUBLIC cxx_std_17)
 
 # Compile definitions for BF16 vs FP32 test
 target_compile_definitions(test_bf16_vs_fp32 PUBLIC COMPILE_CC=${COMPILE_CC})
+
+# Add optimized MoE GEMM test executable
+add_executable(test_optimized_moe_gemm
+    test_optimized_moe_gemm.cpp
+    moe_gemm_relu_kernel.cu
+    moe_gemm_relu_kernel_optimized.cu
+)
+
+# Set CUDA architecture for optimized MoE GEMM test
+set_target_properties(test_optimized_moe_gemm PROPERTIES CUDA_ARCHITECTURES ${COMPILE_CC})
+set_target_properties(test_optimized_moe_gemm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+# Link libraries for optimized MoE GEMM test
+target_link_libraries(test_optimized_moe_gemm ${TORCH_LIBRARIES})
+
+# Include directories for optimized MoE GEMM test
+target_include_directories(test_optimized_moe_gemm PUBLIC ${TORCH_INCLUDE_DIRS})
+target_include_directories(test_optimized_moe_gemm PUBLIC ${CUDA_INCLUDE_DIRS})
+target_include_directories(test_optimized_moe_gemm PUBLIC "${CUDA_HOME}/include")
+target_include_directories(test_optimized_moe_gemm PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass/include")
+target_include_directories(test_optimized_moe_gemm PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass/tools/util/include")
+target_include_directories(test_optimized_moe_gemm PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass_extensions/include")
+
+# Compile features for optimized MoE GEMM test
+target_compile_features(test_optimized_moe_gemm PUBLIC cxx_std_17)
+
+# Compile definitions for optimized MoE GEMM test
+target_compile_definitions(test_optimized_moe_gemm PUBLIC COMPILE_CC=${COMPILE_CC})
+
+# New: BN+SiLU BF16 test
+add_executable(test_moe_bn_silu_bf16
+    test_moe_bn_silu_bf16.cpp
+    moe_gemm_relu_kernel.cu
+)
+set_target_properties(test_moe_bn_silu_bf16 PROPERTIES CUDA_ARCHITECTURES ${COMPILE_CC})
+set_target_properties(test_moe_bn_silu_bf16 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+target_link_libraries(test_moe_bn_silu_bf16 ${TORCH_LIBRARIES})
+
+target_include_directories(test_moe_bn_silu_bf16 PUBLIC ${TORCH_INCLUDE_DIRS})
+target_include_directories(test_moe_bn_silu_bf16 PUBLIC ${CUDA_INCLUDE_DIRS})
+target_include_directories(test_moe_bn_silu_bf16 PUBLIC "${CUDA_HOME}/include")
+target_include_directories(test_moe_bn_silu_bf16 PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass/include")
+target_include_directories(test_moe_bn_silu_bf16 PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass/tools/util/include")
+target_include_directories(test_moe_bn_silu_bf16 PUBLIC "${CMAKE_SOURCE_DIR}/third_party/cutlass_extensions/include")
+
+target_compile_features(test_moe_bn_silu_bf16 PUBLIC cxx_std_17)
+
+target_compile_definitions(test_moe_bn_silu_bf16 PUBLIC COMPILE_CC=${COMPILE_CC})

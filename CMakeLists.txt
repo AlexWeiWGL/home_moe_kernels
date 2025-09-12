@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
-project(Home_MoE LANGUAGES CXX CUDA)
+project(home_kernels LANGUAGES CXX CUDA)
 
 set(CMAKE_BUILD_TYPE Release)
-set(COMPILE_CC 80)  # set the cuda arch
+set(COMPILE_CC 89)  # set the cuda arch for RTX 4090
 
 # 设置CUDA路径
 set(CUDA_HOME "/usr/local/cuda-12.8")
@@ -12,7 +12,9 @@ set(CMAKE_CUDA_RUNTIME_LIBRARY "STATIC")
 # 设置PyTorch路径
 set(TORCH_PREFIX "/root/miniconda3/lib/python3.12/site-packages/torch")
 set(TORCH_INSTALL_PREFIX "${TORCH_PREFIX}")
-set(TORCH_CXX_FLAGS "-DTORCH_EXTENSION_NAME=Home_MoE")
+set(TORCH_CXX_FLAGS "-DTORCH_EXTENSION_NAME=home_kernels")
+
+set(CMAKE_PREFIX_PATH "${TORCH_PREFIX}/share/cmake/Torch" ${CMAKE_PREFIX_PATH})
 
 # lib
 find_package(Torch REQUIRED)  # 更新到实际版本
